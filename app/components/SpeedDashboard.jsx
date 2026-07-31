@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 const STORAGE_KEY = 'speed-check-logs';
-const INTERVAL_MS = 2 * 60 * 1000;
+const INTERVAL_MS = 5 * 1000;
 const DOWNLOAD_SIZE_MB = 5;
 const UPLOAD_SIZE_MB = 2;
 
@@ -262,7 +262,7 @@ export default function SpeedDashboard() {
         {testing
           ? phase || 'Testing...'
           : autoRun
-          ? `Auto-testing every 2 min${countdown > 0 ? ` (next in ${Math.floor(countdown / 60)}:${String(countdown % 60).padStart(2, '0')})` : ''}`
+          ? `Auto-testing every 5s${countdown > 0 ? ` (next in ${countdown}s)` : ''}`
           : `${logs.length} test${logs.length !== 1 ? 's' : ''} recorded`}
       </div>
 
@@ -302,7 +302,7 @@ export default function SpeedDashboard() {
           className={`btn ${autoRun ? 'active' : ''}`}
           onClick={() => setAutoRun(!autoRun)}
         >
-          {autoRun ? 'Stop Auto' : 'Auto (2 min)'}
+          {autoRun ? 'Stop Auto' : 'Auto (5s)'}
         </button>
         {logs.length > 0 && (
           <>
