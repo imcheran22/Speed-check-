@@ -4,8 +4,11 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 
 const STORAGE_KEY = 'speed-check-logs';
 const INTERVAL_MS = 5 * 1000;
-const DOWNLOAD_SIZE_MB = 5;
-const UPLOAD_SIZE_MB = 2;
+const CF_DOWN = 'https://speed.cloudflare.com/__down';
+const CF_UP = 'https://speed.cloudflare.com/__up';
+const PARALLEL_STREAMS = 6;
+const DL_CHUNK_BYTES = 25_000_000;
+const UL_CHUNK_BYTES = 10_000_000;
 
 function loadLogs() {
   if (typeof window === 'undefined') return [];
@@ -24,18 +27,74 @@ function saveLogs(logs) {
 function formatTime(ts) {
   const d = new Date(ts);
   const pad = (n) => String(n).padStart(2, '0');
-  const month = pad(d.getMonth() + 1);
-  const day = pad(d.getDate());
-  const h = pad(d.getHours());
-  const m = pad(d.getMinutes());
-  const s = pad(d.getSeconds());
-  return `${month}/${day} ${h}:${m}:${s}`;
+  return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function getQuality(download) {
+  if (download >= 100) return { label: 'Great', cls: 'good' };
   if (download >= 50) return { label: 'Good', cls: 'good' };
   if (download >= 10) return { label: 'OK', cls: 'ok' };
   return { label: 'Poor', cls: 'poor' };
+}
+
+async function measurePing() {
+  const pings = [];
+  for (let i = 0; i < 8; i++) {
+    const t0 = performance.now();
+    await fetch(`${CF_DOWN}?bytes=0&_=${Date.now()}-${i}`, { cache: 'no-store', mode: 'cors' });
+    pings.push(performance.now() - t0);
+  }
+  pings.sort((a, b) => a - b);
+  const trimmed = pings.slice(1, -1);
+  return Math.round(trimmed.reduce((a, b) => a + b, 0) / trimmed.length);
+}
+
+async function measureDownload(onProgress) {
+  let totalBytes = 0;
+  const startTime = performance.now();
+
+  const downloadChunk = async () => {
+    const resp = await fetch(`${CF_DOWN}?bytes=${DL_CHUNK_BYTES}&_=${Date.now()}-${Math.random()}`, {
+      cache: 'no-store',
+      mode: 'cors',
+    });
+    const reader = resp.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.length;
+      onProgress(totalBytes);
+    }
+  };
+
+  const streams = Array.from({ length: PARALLEL_STREAMS }, () => downloadChunk());
+  await Promise.all(streams);
+
+  const elapsed = (performance.now() - startTime) / 1000;
+  return parseFloat(((totalBytes * 8) / (elapsed * 1_000_000)).toFixed(2));
+}
+
+async function measureUpload(onProgress) {
+  let totalBytes = 0;
+  const startTime = performance.now();
+
+  const uploadChunk = async () => {
+    const data = new Uint8Array(UL_CHUNK_BYTES);
+    await fetch(CF_UP, {
+      method: 'POST',
+      body: data,
+      mode: 'cors',
+      cache: 'no-store',
+    });
+    totalBytes += data.length;
+    onProgress(totalBytes);
+  };
+
+  const streams = Array.from({ length: PARALLEL_STREAMS }, () => uploadChunk());
+  await Promise.all(streams);
+
+  const elapsed = (performance.now() - startTime) / 1000;
+  return parseFloat(((totalBytes * 8) / (elapsed * 1_000_000)).toFixed(2));
 }
 
 function SpeedChart({ logs }) {
@@ -121,65 +180,43 @@ export default function SpeedDashboard() {
   const [countdown, setCountdown] = useState(0);
   const intervalRef = useRef(null);
   const countdownRef = useRef(null);
+  const testingRef = useRef(false);
 
   useEffect(() => {
     setLogs(loadLogs());
   }, []);
 
   const runTest = useCallback(async () => {
-    if (testing) return;
+    if (testingRef.current) return;
+    testingRef.current = true;
     setTesting(true);
     setProgress(0);
 
     const result = { timestamp: Date.now(), download: 0, upload: 0, ping: 0 };
+    const totalDlBytes = DL_CHUNK_BYTES * PARALLEL_STREAMS;
+    const totalUlBytes = UL_CHUNK_BYTES * PARALLEL_STREAMS;
 
     try {
       setPhase('Measuring ping...');
       setProgress(5);
-      const pings = [];
-      for (let i = 0; i < 5; i++) {
-        const t0 = performance.now();
-        await fetch('/api/ping?_=' + Date.now(), { cache: 'no-store' });
-        pings.push(performance.now() - t0);
-      }
-      pings.sort((a, b) => a - b);
-      result.ping = Math.round(pings[Math.floor(pings.length / 2)]);
-      setProgress(15);
+      result.ping = await measurePing();
+      setProgress(10);
 
       setPhase('Testing download...');
-      const dlStart = performance.now();
-      const dlResp = await fetch(`/api/download?size=${DOWNLOAD_SIZE_MB}&_=${Date.now()}`, {
-        cache: 'no-store',
+      result.download = await measureDownload((bytes) => {
+        setProgress(10 + Math.round((bytes / totalDlBytes) * 50));
       });
-      const reader = dlResp.body.getReader();
-      let dlBytes = 0;
-      const contentLength = parseInt(dlResp.headers.get('content-length') || '0', 10);
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        dlBytes += value.length;
-        if (contentLength > 0) {
-          setProgress(15 + Math.round((dlBytes / contentLength) * 45));
-        }
-      }
-      const dlTime = (performance.now() - dlStart) / 1000;
-      result.download = parseFloat(((dlBytes * 8) / (dlTime * 1000000)).toFixed(2));
       setProgress(60);
 
       setPhase('Testing upload...');
-      const ulData = new Uint8Array(UPLOAD_SIZE_MB * 1024 * 1024);
-      const ulStart = performance.now();
-      await fetch('/api/upload', {
-        method: 'POST',
-        body: ulData,
-        headers: { 'Content-Type': 'application/octet-stream' },
+      result.upload = await measureUpload((bytes) => {
+        setProgress(60 + Math.round((bytes / totalUlBytes) * 35));
       });
-      const ulTime = (performance.now() - ulStart) / 1000;
-      result.upload = parseFloat(((ulData.length * 8) / (ulTime * 1000000)).toFixed(2));
-      setProgress(95);
+      setProgress(98);
     } catch (err) {
       console.error('Speed test error:', err);
       setPhase('Test failed - check connection');
+      testingRef.current = false;
       setTesting(false);
       setProgress(0);
       return;
@@ -196,10 +233,11 @@ export default function SpeedDashboard() {
     });
 
     setTimeout(() => {
+      testingRef.current = false;
       setTesting(false);
       setProgress(0);
     }, 500);
-  }, [testing]);
+  }, []);
 
   useEffect(() => {
     if (autoRun) {
@@ -252,7 +290,7 @@ export default function SpeedDashboard() {
     <div className="container">
       <div className="header">
         <h1>Speed Check</h1>
-        <p>WiFi &amp; Internet Speed Tracker</p>
+        <p>WiFi &amp; Internet Speed Tracker &middot; Powered by Cloudflare</p>
       </div>
 
       <div className="status-bar">
